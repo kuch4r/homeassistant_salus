@@ -1010,8 +1010,14 @@ class IT600Gateway:
                 elif ther is not None and scomm is not None:
                     # TRV devices (e.g. TRV3RF): sTherS + sComm, no sFanS.
                     # Heating-only TRVs with battery power and valve control.
+                    # On/off is sTherS.SystemMode (0 = off, 4 = heat), as set by
+                    # the Salus app; HoldType is only the schedule/hold mode and
+                    # a TRV3RF keeps heating with HoldType 7.
                     hold = scomm["HoldType"]
                     running = ther["RunningState"]
+                    trv_off = (
+                        ther["SystemMode"] == 0 if "SystemMode" in ther else hold == 7
+                    )
 
                     # Valve opening percentage from sIT6ZB cluster.
                     trv_attrs: dict[str, Any] = {}
@@ -1030,14 +1036,14 @@ class IT600Gateway:
                         min_temp=ther.get("MinHeatSetpoint_x100", 500) / 100,
                         hvac_mode=(
                             HVAC_MODE_OFF
-                            if hold == 7
+                            if trv_off
                             else HVAC_MODE_HEAT
                             if hold == 2
                             else HVAC_MODE_AUTO
                         ),
                         hvac_action=(
                             CURRENT_HVAC_OFF
-                            if hold == 7
+                            if trv_off
                             else CURRENT_HVAC_IDLE
                             if running == 0
                             else CURRENT_HVAC_HEAT
@@ -1049,7 +1055,7 @@ class IT600Gateway:
                         ],
                         preset_mode=(
                             PRESET_OFF
-                            if hold == 7
+                            if trv_off
                             else PRESET_PERMANENT_HOLD
                             if hold == 2
                             else PRESET_FOLLOW_SCHEDULE
@@ -1441,14 +1447,15 @@ class IT600Gateway:
             )
             payload = {"sComm": {"SetHoldType": hold}}
         elif device.model in TRV_VOLTAGE_MODELS:
-            hold = (
-                7
+            await self._set_trv_state(
+                device,
+                None
                 if preset == PRESET_OFF
                 else 2
                 if preset == PRESET_PERMANENT_HOLD
-                else 0
+                else 0,
             )
-            payload = {"sComm": {"SetHoldType": hold}}
+            return
         else:
             hold = (
                 7
@@ -1480,9 +1487,11 @@ class IT600Gateway:
             )
             payload = {"sTherS": {"SetSystemMode": sys_mode}}
         elif device.model in TRV_VOLTAGE_MODELS:
-            # TRV: HoldType 7 = off, 2 = permanent hold (heat), 0 = follow schedule (auto)
-            hold = 7 if mode == HVAC_MODE_OFF else 2 if mode == HVAC_MODE_HEAT else 0
-            payload = {"sComm": {"SetHoldType": hold}}
+            await self._set_trv_state(
+                device,
+                None if mode == HVAC_MODE_OFF else 2 if mode == HVAC_MODE_HEAT else 0,
+            )
+            return
         else:
             # iT600: HoldType 7 = off, 2 = permanent hold (heat), 0 = follow schedule (auto)
             hold = 7 if mode == HVAC_MODE_OFF else 2 if mode == HVAC_MODE_HEAT else 0
@@ -1495,6 +1504,32 @@ class IT600Gateway:
                 "id": [{"data": device.data, **payload}],
             },
         )
+
+    async def _set_trv_state(self, device: ClimateDevice, hold: int | None) -> None:
+        """TRV3RF: off via sTherS.SystemMode 0 (what the Salus app's Standby sends;
+        SetHoldType 7 does not stop it heating). Otherwise make sure it is on
+        (SystemMode 4), then set the hold type (2 = permanent hold, 0 = schedule)."""
+        if hold is None or device.hvac_mode == HVAC_MODE_OFF:
+            await self._make_encrypted_request(
+                "write",
+                {
+                    "requestAttr": "write",
+                    "id": [
+                        {
+                            "data": device.data,
+                            "sTherS": {"SetSystemMode": 0 if hold is None else 4},
+                        }
+                    ],
+                },
+            )
+        if hold is not None:
+            await self._make_encrypted_request(
+                "write",
+                {
+                    "requestAttr": "write",
+                    "id": [{"data": device.data, "sComm": {"SetHoldType": hold}}],
+                },
+            )
 
     async def set_climate_device_fan_mode(self, device_id: str, mode: str) -> None:
         device = self.get_climate_device(device_id)

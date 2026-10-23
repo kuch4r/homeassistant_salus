@@ -1062,10 +1062,10 @@ class TestRefreshClimateDevices:
                         "MaxHeatSetpoint_x100": 3500,
                         "MinHeatSetpoint_x100": 500,
                         "CoolingSetpoint_x100": 2400,
-                        "SystemMode": 4,
+                        "SystemMode": 0,
                         "RunningState": 0,
                     },
-                    "sComm": {"HoldType": 7},
+                    "sComm": {"HoldType": 2},
                     "sZDOInfo": {"OnlineStatus_i": 1},
                     "sZDO": {
                         "DeviceName": '{"deviceName": "TRV Off"}',
@@ -1089,6 +1089,44 @@ class TestRefreshClimateDevices:
         assert dev.hvac_mode == HVAC_MODE_OFF
         assert dev.hvac_action == CURRENT_HVAC_OFF
         assert dev.preset_mode == PRESET_OFF
+
+    async def test_trv3rf_holdtype_7_is_not_off(self):
+        """HoldType 7 (written by older versions for "off") does not switch a
+        TRV3RF off: with SystemMode 4 it keeps heating."""
+        gw = _make_gateway()
+        devices = [{"data": {"UniID": "trv_007"}, "sTherS": {}}]
+        resp = {
+            "status": "success",
+            "id": [
+                {
+                    "data": {"UniID": "trv_007", "Endpoint": 1},
+                    "sTherS": {
+                        "LocalTemperature_x100": 1800,
+                        "HeatingSetpoint_x100": 2100,
+                        "MaxHeatSetpoint_x100": 3500,
+                        "MinHeatSetpoint_x100": 500,
+                        "SystemMode": 4,
+                        "RunningState": 1,
+                    },
+                    "sComm": {"HoldType": 7, "HoldType_a": 2},
+                    "sZDOInfo": {"OnlineStatus_i": 1},
+                    "sZDO": {"DeviceName": '{"deviceName": "TRV 7"}'},
+                    "DeviceL": {"ModelIdentifier_i": "TRV3RF"},
+                }
+            ],
+        }
+        with patch.object(
+            gw,
+            "_make_encrypted_request",
+            new_callable=AsyncMock,
+            return_value=resp,
+        ):
+            await gw._refresh_climate_devices(devices)
+
+        dev = gw.get_climate_device("trv_007")
+        assert dev.hvac_mode == HVAC_MODE_AUTO
+        assert dev.hvac_action == CURRENT_HVAC_HEAT
+        assert dev.preset_mode == PRESET_FOLLOW_SCHEDULE
 
     async def test_trv3rf_auto_mode(self):
         gw = _make_gateway()
@@ -2698,7 +2736,8 @@ class TestCommands:
         ) as mock_req:
             await gw.set_climate_device_preset("trv_cmd2", PRESET_OFF)
         call_body = mock_req.call_args[0][1]
-        assert call_body["id"][0]["sComm"]["SetHoldType"] == 7
+        assert call_body["id"][0]["sTherS"] == {"SetSystemMode": 0}
+        assert "sComm" not in call_body["id"][0]
 
         with patch.object(
             gw, "_make_encrypted_request", new_callable=AsyncMock
@@ -2751,7 +2790,8 @@ class TestCommands:
         ) as mock_req:
             await gw.set_climate_device_mode("trv_cmd3", HVAC_MODE_OFF)
         call_body = mock_req.call_args[0][1]
-        assert call_body["id"][0]["sComm"]["SetHoldType"] == 7
+        assert call_body["id"][0]["sTherS"] == {"SetSystemMode": 0}
+        assert "sComm" not in call_body["id"][0]
 
         with patch.object(
             gw, "_make_encrypted_request", new_callable=AsyncMock
@@ -2766,6 +2806,65 @@ class TestCommands:
             await gw.set_climate_device_mode("trv_cmd3", HVAC_MODE_AUTO)
         call_body = mock_req.call_args[0][1]
         assert call_body["id"][0]["sComm"]["SetHoldType"] == 0
+
+    async def test_trv3rf_switched_on_before_hold_when_off(self):
+        """An off TRV3RF (SystemMode 0) is switched back on first, then the hold
+        type is set: two writes, one per cluster."""
+        from dataclasses import replace
+
+        from custom_components.salus.models import ClimateDevice
+
+        trv = ClimateDevice(
+            available=True,
+            name="TRV",
+            unique_id="trv_cmd4",
+            temperature_unit="°C",
+            precision=0.1,
+            current_temperature=19.0,
+            target_temperature=5.0,
+            max_temp=35.0,
+            min_temp=5.0,
+            current_humidity=None,
+            hvac_mode=HVAC_MODE_OFF,
+            hvac_action=CURRENT_HVAC_OFF,
+            hvac_modes=[HVAC_MODE_OFF, HVAC_MODE_HEAT, HVAC_MODE_AUTO],
+            preset_mode=PRESET_OFF,
+            preset_modes=[PRESET_FOLLOW_SCHEDULE, PRESET_PERMANENT_HOLD, PRESET_OFF],
+            fan_mode=None,
+            fan_modes=None,
+            locked=False,
+            supported_features=SUPPORT_TARGET_TEMPERATURE | SUPPORT_PRESET_MODE,
+            device_class="temperature",
+            data={"UniID": "trv_cmd4", "Endpoint": 1},
+            manufacturer="SALUS",
+            model="TRV3RF",
+            sw_version="45002000",
+        )
+        gw = _make_gateway()
+        for call, arg, hold in (
+            (gw.set_climate_device_preset, PRESET_PERMANENT_HOLD, 2),
+            (gw.set_climate_device_mode, HVAC_MODE_HEAT, 2),
+            (gw.set_climate_device_mode, HVAC_MODE_AUTO, 0),
+        ):
+            gw._climate_devices = {"trv_cmd4": trv}
+            with patch.object(
+                gw, "_make_encrypted_request", new_callable=AsyncMock
+            ) as mock_req:
+                await call("trv_cmd4", arg)
+            bodies = [c[0][1]["id"][0] for c in mock_req.call_args_list]
+            assert bodies[0]["sTherS"] == {"SetSystemMode": 4}
+            assert bodies[1]["sComm"] == {"SetHoldType": hold}
+            assert len(bodies) == 2
+
+        # Already on: only the hold type is written.
+        gw._climate_devices = {"trv_cmd4": replace(trv, hvac_mode=HVAC_MODE_AUTO)}
+        with patch.object(
+            gw, "_make_encrypted_request", new_callable=AsyncMock
+        ) as mock_req:
+            await gw.set_climate_device_preset("trv_cmd4", PRESET_PERMANENT_HOLD)
+        assert [c[0][1]["id"][0]["sComm"] for c in mock_req.call_args_list] == [
+            {"SetHoldType": 2}
+        ]
 
     async def test_missing_device_logs_error(self):
         gw = _make_gateway()
