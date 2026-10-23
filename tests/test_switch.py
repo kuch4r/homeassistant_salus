@@ -76,3 +76,34 @@ class TestSalusSwitchCommands:
         entity, _ = _make_entity(switch_device)
         await entity.async_turn_off()
         entity.coordinator.async_request_refresh.assert_awaited_once()
+
+
+class TestSalusSwitchPendingState:
+    """The gateway reports the old state for a while after a write; the entity must
+    not jump back to it (which made users switch twice)."""
+
+    async def test_keeps_new_state_while_gateway_lags(self, switch_device):
+        entity, _ = _make_entity(switch_device)  # gateway still reports on
+        await entity.async_turn_off()
+        assert entity.is_on is False
+
+    async def test_follows_gateway_once_confirmed(self, switch_device):
+        from dataclasses import replace
+
+        entity, gw = _make_entity(switch_device)
+        await entity.async_turn_off()
+        gw.get_switch_device.return_value = replace(switch_device, is_on=False)
+        assert entity.is_on is False
+        # Later changes made elsewhere (Salus app, panel) are shown again.
+        gw.get_switch_device.return_value = switch_device
+        assert entity.is_on is True
+
+    async def test_gives_up_after_timeout(self, switch_device, monkeypatch):
+        import custom_components.salus.switch as switch_mod
+
+        now = [1000.0]
+        monkeypatch.setattr(switch_mod.time, "monotonic", lambda: now[0])
+        entity, _ = _make_entity(switch_device)
+        await entity.async_turn_off()
+        now[0] += switch_mod.PENDING_TIMEOUT_S + 1
+        assert entity.is_on is True  # command never took effect
